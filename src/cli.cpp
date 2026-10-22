@@ -65,7 +65,7 @@ namespace divider
             return value;
         }
 
-        double parsePercent(std::string_view text, std::string_view option)
+        double parsePercent(std::string_view text, std::string_view option, std::string_view what = "tolerance")
         {
             std::string owned(text);
             char* end = nullptr;
@@ -73,7 +73,7 @@ namespace divider
             const double value = std::strtod(owned.c_str(), &end);
             if (end == owned.c_str() || *end != '\0' || errno == ERANGE || !std::isfinite(value) || value < 0.0 || value >= 100.0)
             {
-                throw std::invalid_argument("Invalid tolerance for " + std::string(option) + ". Expected 0 <= value < 100 percent.");
+                throw std::invalid_argument("Invalid " + std::string(what) + " for " + std::string(option) + ". Expected 0 <= value < 100 percent.");
             }
             return value;
         }
@@ -185,7 +185,24 @@ namespace divider
             return false;
         }
 
-        void parseSeriesList(int argc, char** argv, int& index, Options& options)
+        OutputFormat parseFormat(std::string_view text)
+        {
+            if (text == "table")
+            {
+                return OutputFormat::Table;
+            }
+            if (text == "csv")
+            {
+                return OutputFormat::Csv;
+            }
+            if (text == "json")
+            {
+                return OutputFormat::Json;
+            }
+            throw std::invalid_argument("Invalid --format value. Expected table, csv or json.");
+        }
+
+        void parseSeriesList(int argc, char** argv, int& index, std::vector<int>& selectedSeries, std::string_view option)
         {
             bool foundSeries = false;
             while (index + 1 < argc)
@@ -198,16 +215,16 @@ namespace divider
 
                 ++index;
                 const int seriesValue = parseSeriesSelector(next);
-                if (!containsSeries(options.selectedSeries, seriesValue))
+                if (!containsSeries(selectedSeries, seriesValue))
                 {
-                    options.selectedSeries.push_back(seriesValue);
+                    selectedSeries.push_back(seriesValue);
                 }
                 foundSeries = true;
             }
 
             if (!foundSeries)
             {
-                throw std::invalid_argument("Missing series list after --E.");
+                throw std::invalid_argument("Missing series list after " + std::string(option) + ".");
             }
         }
 
@@ -230,7 +247,15 @@ namespace divider
             }
             if (!options.useVoltage && options.powerRange.enabled)
             {
-                throw std::invalid_argument("--power is only valid with --vin-vout.");
+                throw std::invalid_argument("--power is only valid with --vin-vout or --vin.");
+            }
+            if (!options.useVoltage && options.ratedPower)
+            {
+                throw std::invalid_argument("--rating is only valid with --vin-vout or --vin.");
+            }
+            if (options.deratePercent && !options.ratedPower)
+            {
+                throw std::invalid_argument("--derate requires --rating.");
             }
         }
 
@@ -241,6 +266,7 @@ namespace divider
         Options options;
         bool ratioProvided = false;
         bool voltageProvided = false;
+        std::optional<double> inputVoltage;
 
         for (int index = 1; index < argc; ++index)
         {
@@ -299,7 +325,47 @@ namespace divider
 
             if (isOption(arg, "--E"))
             {
-                parseSeriesList(argc, argv, index, options);
+                parseSeriesList(argc, argv, index, options.selectedSeries, arg);
+                continue;
+            }
+
+            if (isOption(arg, "--E-high"))
+            {
+                parseSeriesList(argc, argv, index, options.highSeries, arg);
+                continue;
+            }
+
+            if (isOption(arg, "--E-low"))
+            {
+                parseSeriesList(argc, argv, index, options.lowSeries, arg);
+                continue;
+            }
+
+            if (isOption(arg, "--vin"))
+            {
+                const double value = requireSiArgument(argc, argv, index, arg);
+                if (value <= 0.0) throw std::invalid_argument("--vin must be positive.");
+                inputVoltage = value;
+                continue;
+            }
+
+            if (isOption(arg, "--rating"))
+            {
+                const double value = requireSiArgument(argc, argv, index, arg);
+                if (value <= 0.0) throw std::invalid_argument("--rating must be positive.");
+                options.ratedPower = value;
+                continue;
+            }
+
+            if (isOption(arg, "--derate"))
+            {
+                options.deratePercent = parsePercent(requireArgument(argc, argv, index, arg), arg, "derating");
+                continue;
+            }
+
+            if (isOption(arg, "--format"))
+            {
+                options.format = parseFormat(requireArgument(argc, argv, index, arg));
                 continue;
             }
 
@@ -365,6 +431,25 @@ namespace divider
             throw std::invalid_argument("Missing target. Use --ratio or --vin-vout.");
         }
 
+        if (inputVoltage)
+        {
+            if (voltageProvided)
+            {
+                throw std::invalid_argument("--vin cannot be combined with --vin-vout.");
+            }
+            if (!ratioProvided)
+            {
+                throw std::invalid_argument("--vin requires --ratio.");
+            }
+            if (!std::isfinite(options.ratio) || options.ratio <= 0.0 || options.ratio >= 1.0)
+            {
+                throw std::invalid_argument("Invalid ratio. Expected 0 < ratio < 1.");
+            }
+            options.vin = *inputVoltage;
+            options.vout = options.ratio * options.vin;
+            options.useVoltage = true;
+        }
+
         validateOptions(options);
         return options;
     }
@@ -375,6 +460,7 @@ namespace divider
         out << "Usage:\n"
             << "  " << executableName << " --ratio RATIO [--top N] [--digits N] [filters] [tolerances]\n"
             << "  " << executableName << " --vin-vout VIN VOUT [--top N] [--digits N] [filters] [tolerances]\n"
+            << "  " << executableName << " --ratio RATIO --vin VIN [--top N] [--digits N] [filters] [tolerances]\n"
             << "\n"
             << "Options:\n"
             << "  --top N              Print the best N candidates per E series. Default: 10.\n"
@@ -383,6 +469,10 @@ namespace divider
             << "                       score = abs(nominal error) * F + (abs(high error) + abs(low error)) * (1 - F).\n"
             << "                       F=1 ranks only by nominal error; F=0 ranks only by tolerance error.\n"
             << "  --E LIST             Evaluate only selected E series, e.g. --E 96 192.\n"
+            << "  --E-high LIST        E series for the upper resistor; with --E-low, every combination is evaluated.\n"
+            << "  --E-low LIST         E series for the lower resistor. A missing list falls back to --E, then all series.\n"
+            << "  --vin VIN            Input voltage for --ratio mode; enables voltage, power and --rating output.\n"
+            << "  --format FORMAT      Output as table (default), csv or json. csv and json use base units.\n"
             << "  --load OHMS          Fixed load resistance from VOUT to ground (default: no load).\n"
             << "                       Load remains fixed when evaluating resistor tolerances.\n"
             << "\n"
@@ -392,7 +482,10 @@ namespace divider
             << "  --max-error PCT      Maximum absolute error including tolerance extremes.\n"
             << "  --series MIN MAX     Keep dividers with R_high + R_low in range.\n"
             << "  --parallel MIN MAX   Keep dividers with R_high || R_low in range.\n"
-            << "  --power MIN MAX      Keep total resistor power in range (excludes load); only with --vin-vout.\n"
+            << "  --power MIN MAX      Keep total resistor power in range (excludes load); needs --vin-vout or --vin.\n"
+            << "  --rating WATTS       Keep dividers whose worst-case power (over tolerances) in each resistor\n"
+            << "                       does not exceed WATTS; needs --vin-vout or --vin. Adds max power columns.\n"
+            << "  --derate PCT         With --rating, use WATTS * (1 - PCT/100) as the limit. Default: 0.\n"
             << "\n"
             << "Tolerance overrides, in percent:\n"
             << "  --E3 PCT --E6 PCT --E12 PCT --E24 PCT --E48 PCT --E96 PCT --E192 PCT\n"
@@ -402,12 +495,14 @@ namespace divider
             << "\n"
             << "Voltage output:\n"
             << "  Includes VOUT min/max under tolerance and nominal power in each resistor.\n"
-            << "  Total resistor power excludes the load; power values are nominal.\n"
+            << "  Total resistor power excludes the load; power values are nominal unless marked max.\n"
+            << "  Tolerances are per series: --E-high 96 --E-low 24 uses the E96 tolerance above and E24 below.\n"
             << "\n"
             << "Examples:\n"
             << "  " << executableName << " --ratio 0.275 --top 5 --E 96 192 --series 1k 1M\n"
             << "  " << executableName << " --vin-vout 12 3.3 --top 3 --parallel 1k 100k --power 1m 100m\n"
-            << "  " << executableName << " --vin-vout 12 3.3 --E 192 --load 100k --high 10k 100k --low 1k 50k --max-error 1\n";
+            << "  " << executableName << " --vin-vout 12 3.3 --E 192 --load 100k --high 10k 100k --low 1k 50k --max-error 1\n"
+            << "  " << executableName << " --ratio 0.275 --vin 24 --E-high 96 --E-low 24 --rating 0.125 --derate 50 --format csv\n";
         return out.str();
     }
 

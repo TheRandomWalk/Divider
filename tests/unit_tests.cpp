@@ -4,6 +4,7 @@
 #include "divider/si.h"
 #include "divider/table.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <functional>
@@ -14,6 +15,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace
@@ -931,6 +933,199 @@ namespace
             "Missing value after --ratio");
     }
 
+    void testIndependentToleranceAndValueLists()
+    {
+        divider::SearchConfig config;
+        config.targetRatio = 0.5;
+        config.tolerancePercent = 10.0;
+        config.lowTolerancePercent = 0.0;
+        const auto result = divider::findBestCandidates({1000.0}, {1000.0}, config);
+        expectTrue(result.size() == 1, "Expected one mixed-tolerance candidate.");
+        expectNear(result[0].ratioLow, 1000.0 / (1100.0 + 1000.0));
+        expectNear(result[0].ratioHigh, 1000.0 / (900.0 + 1000.0));
+
+        const auto separate = divider::findBestCandidates({1000.0, 2000.0}, {500.0, 1000.0}, config);
+        expectTrue(separate.size() == 4, "Expected the product of both value lists.");
+        divider::SearchConfig invalid = config;
+        invalid.lowTolerancePercent = 100.0;
+        expectThrows([&] { divider::findBestCandidates({1000.0}, {1000.0}, invalid); }, "Invalid search target");
+    }
+
+    void testMixedSearchMatchesExhaustive()
+    {
+        const std::vector<double> high{1000, 2200, 4700, 10000, 33000};
+        const std::vector<double> low{470, 1000, 3300, 6800, 22000};
+        for (double ratio : {0.1, 0.3, 0.5})
+        for (bool loaded : {false, true})
+        {
+            divider::SearchConfig config;
+            config.targetRatio = ratio;
+            config.tolerancePercent = 1.0;
+            config.lowTolerancePercent = 20.0;
+            config.vin = 12.0;
+            config.vout = 12.0 * ratio;
+            config.top = 1000;
+            if (loaded) config.loadResistance = 4700.0;
+            const auto all = divider::findBestCandidates(high, low, config);
+            expectTrue(all.size() == high.size() * low.size(), "Expected every mixed pair.");
+
+            auto filtered = config;
+            filtered.top = 4;
+            filtered.maxErrorPercent = 60.0;
+            filtered.lowRange = {true, 1000, 22000};
+            filtered.seriesRange = {true, 3000, 40000};
+            std::vector<divider::DividerCandidate> expected;
+            for (const auto& c : all)
+            {
+                if (filtered.lowRange.contains(c.rLow) && filtered.seriesRange.contains(c.rSeries) &&
+                    std::max(std::abs(c.lowRatioErrorPercent), std::abs(c.highRatioErrorPercent)) <= *filtered.maxErrorPercent)
+                    expected.push_back(c);
+            }
+            if (expected.size() > filtered.top) expected.resize(filtered.top);
+            const auto actual = divider::findBestCandidates(high, low, filtered);
+            expectTrue(actual.size() == expected.size(), "Mixed optimized search lost candidates.");
+            for (std::size_t i = 0; i < actual.size(); ++i)
+            {
+                expectNear(actual[i].rHigh, expected[i].rHigh);
+                expectNear(actual[i].rLow, expected[i].rLow);
+            }
+        }
+    }
+
+    void testWorstCasePowerMatchesGrid()
+    {
+        for (bool loaded : {false, true})
+        for (double tolerance : {0.0, 1.0, 20.0, 40.0})
+        for (const auto& pair : {std::pair<double, double>{1000, 1000}, {1000, 3000}, {5000, 700}, {2200, 2300}})
+        {
+            divider::SearchConfig config;
+            config.targetRatio = 0.5;
+            config.tolerancePercent = tolerance;
+            config.lowTolerancePercent = tolerance / 2.0;
+            config.vin = 10.0;
+            config.vout = 5.0;
+            if (loaded) config.loadResistance = 1500.0;
+            const auto result = divider::findBestCandidates({pair.first}, {pair.second}, config);
+            expectTrue(result.size() == 1, "Expected one candidate.");
+
+            const double highTol = tolerance / 100.0;
+            const double lowTol = tolerance / 200.0;
+            double gridHigh = 0.0;
+            double gridLow = 0.0;
+            constexpr int steps = 400;
+            for (int i = 0; i <= steps; ++i)
+            for (int j = 0; j <= steps; ++j)
+            {
+                const double rh = pair.first * (1.0 - highTol + 2.0 * highTol * i / steps);
+                const double rl = pair.second * (1.0 - lowTol + 2.0 * lowTol * j / steps);
+                const double bottom = loaded ? rl * 1500.0 / (rl + 1500.0) : rl;
+                const double vout = 10.0 * bottom / (rh + bottom);
+                gridHigh = std::max(gridHigh, (10.0 - vout) * (10.0 - vout) / rh);
+                gridLow = std::max(gridLow, vout * vout / rl);
+            }
+            expectTrue(result[0].powerHighMax >= gridHigh * (1.0 - 1.0e-12) && result[0].powerHighMax <= gridHigh * (1.0 + 1.0e-4), "Worst-case upper power must match a dense grid.");
+            expectTrue(result[0].powerLowMax >= gridLow * (1.0 - 1.0e-12) && result[0].powerLowMax <= gridLow * (1.0 + 1.0e-4), "Worst-case lower power must match a dense grid.");
+            expectTrue(result[0].powerHighMax >= result[0].powerHigh * (1.0 - 1.0e-12), "Worst case cannot be below nominal power.");
+            expectTrue(result[0].powerLowMax >= result[0].powerLow * (1.0 - 1.0e-12), "Worst case cannot be below nominal power.");
+        }
+    }
+
+    void testRatedPowerFilter()
+    {
+        divider::SearchConfig config;
+        config.targetRatio = 0.5;
+        config.tolerancePercent = 10.0;
+        config.vin = 10.0;
+        config.vout = 5.0;
+        config.top = 10;
+        const auto all = divider::findBestCandidates({100.0, 1000.0}, {100.0, 1000.0}, config);
+        expectTrue(all.size() == 4, "Expected four unfiltered candidates.");
+
+        // 100 / 100 ohms dissipates 0.25 W per resistor nominally, so a 0.25 W rating fails once tolerances are included.
+        config.ratedPower = 0.25;
+        for (const auto& candidate : divider::findBestCandidates({100.0, 1000.0}, {100.0, 1000.0}, config))
+            expectTrue(std::max(candidate.powerHighMax, candidate.powerLowMax) <= 0.25, "Rated power filter kept an overloaded resistor.");
+        expectTrue(divider::findBestCandidates({100.0, 1000.0}, {100.0, 1000.0}, config).size() < all.size(), "Expected the rating to remove candidates.");
+
+        config.ratedPower = 1.0;
+        expectTrue(divider::findBestCandidates({100.0, 1000.0}, {100.0, 1000.0}, config).size() == all.size(), "Expected a generous rating to keep every candidate.");
+
+        config.vin.reset();
+        config.vout.reset();
+        expectThrows([&] { divider::findBestCandidates({100.0}, {100.0}, config); }, "Rated power filtering requires VIN");
+    }
+
+    void testCliMixedSeriesPowerAndFormat()
+    {
+        auto options = parseArgs({"divider", "--ratio", "0.25", "--vin", "12", "--E-high", "96", "24", "--E-low", "E12", "--rating", "125m", "--derate", "50", "--format", "csv", "--power", "0", "1"});
+        expectTrue(options.useVoltage, "Expected --vin to enable voltage mode.");
+        expectNear(options.vin, 12.0);
+        expectNear(options.vout, 3.0);
+        expectTrue(options.highSeries.size() == 2 && options.highSeries[0] == 96 && options.highSeries[1] == 24, "Expected upper series list.");
+        expectTrue(options.lowSeries.size() == 1 && options.lowSeries[0] == 12, "Expected lower series list.");
+        expectNear(*options.ratedPower, 0.125);
+        expectNear(*options.deratePercent, 50.0);
+        expectTrue(options.format == divider::OutputFormat::Csv, "Expected csv format.");
+        expectTrue(parseArgs({"divider", "--ratio", "0.5"}).format == divider::OutputFormat::Table, "Expected table by default.");
+        expectTrue(parseArgs({"divider", "--ratio", "0.5", "--format", "json"}).format == divider::OutputFormat::Json, "Expected json format.");
+
+        expectThrows([] { parseArgs({"divider", "--ratio", "0.5", "--format", "xml"}); }, "Invalid --format");
+        expectThrows([] { parseArgs({"divider", "--ratio", "0.5", "--rating", "1"}); }, "--rating is only valid");
+        expectThrows([] { parseArgs({"divider", "--ratio", "0.5", "--vin", "5", "--derate", "10"}); }, "--derate requires --rating");
+        expectThrows([] { parseArgs({"divider", "--ratio", "0.5", "--vin", "5", "--rating", "1", "--derate", "100"}); }, "Invalid derating");
+        expectThrows([] { parseArgs({"divider", "--vin-vout", "5", "1", "--vin", "5"}); }, "cannot be combined");
+        expectThrows([] { parseArgs({"divider", "--vin-vout", "5", "1", "--rating", "0"}); }, "--rating must be positive");
+        expectThrows([] { parseArgs({"divider", "--ratio", "0.5", "--E-high"}); }, "Missing series list after --E-high");
+        expectThrows([] { parseArgs({"divider", "--ratio", "0.5", "--E-low", "7"}); }, "Invalid --E series");
+        expectThrows([] { parseArgs({"divider", "--vin", "5"}); }, "Missing target");
+    }
+
+    void testMachineReadableOutput()
+    {
+        divider::SeriesResult result;
+        result.highName = "E96";
+        result.lowName = "E24";
+        result.highValueCount = 96;
+        result.lowValueCount = 24;
+        result.highTolerancePercent = 1.0;
+        result.lowTolerancePercent = 5.0;
+        divider::SearchConfig config;
+        config.targetRatio = 0.25;
+        config.tolerancePercent = 1.0;
+        config.lowTolerancePercent = 5.0;
+        config.vin = 12.0;
+        config.vout = 3.0;
+        config.top = 2;
+        result.candidates = divider::findBestCandidates({3000.0}, {1000.0}, config);
+
+        std::ostringstream csv;
+        divider::printCsv(csv, {result}, true);
+        const std::string csvText = csv.str();
+        expectTrue(csvText.rfind("rank,high_series,low_series,high_tolerance_pct,low_tolerance_pct,r_high_ohm,r_low_ohm", 0) == 0, "Expected CSV header.");
+        expectTrue(csvText.find("power_high_max_w") != std::string::npos, "Expected worst-case power column in voltage CSV.");
+        expectTrue(csvText.find("1,E96,E24,1,5,3000,1000,4000,750,0.25,") != std::string::npos, "Expected CSV row in base units.");
+
+        std::ostringstream ratioCsv;
+        divider::printCsv(ratioCsv, {result}, false);
+        expectTrue(ratioCsv.str().find("vout_min_v") == std::string::npos, "Ratio CSV must omit voltage columns.");
+
+        std::ostringstream json;
+        divider::printJson(json, {result}, true);
+        expectTrue(json.str().find("\"high_series\": \"E96\"") != std::string::npos, "Expected JSON series.");
+        expectTrue(json.str().find("\"r_high_ohm\": 3000") != std::string::npos, "Expected JSON values in base units.");
+
+        divider::SeriesResult empty = result;
+        empty.candidates.clear();
+        std::ostringstream emptyJson;
+        divider::printJson(emptyJson, {empty}, false);
+        expectTrue(emptyJson.str().find("\"candidates\": []") != std::string::npos, "Expected empty JSON candidate list.");
+
+        std::ostringstream table;
+        divider::printPairTable(table, result, 3, true, false, true);
+        expectTrue(table.str().find("top E96 (+/-1%) / bottom E24 (+/-5%)") != std::string::npos, "Expected mixed-series title.");
+        expectTrue(table.str().find("top max power (W)") != std::string::npos, "Expected worst-case power columns.");
+    }
+
 } // namespace
 
 int main()
@@ -972,6 +1167,12 @@ int main()
         {"CLI series selection", testCliSeriesSelection},
         {"CLI series selection accepts names and deduplicates", testCliSeriesSelectionAcceptsNamesAndDeduplicates},
         {"CLI validation errors", testCliValidationErrors},
+        {"independent tolerances and value lists", testIndependentToleranceAndValueLists},
+        {"mixed search matches exhaustive", testMixedSearchMatchesExhaustive},
+        {"worst-case power matches grid", testWorstCasePowerMatchesGrid},
+        {"rated power filter", testRatedPowerFilter},
+        {"CLI mixed series, power and format", testCliMixedSeriesPowerAndFormat},
+        {"machine-readable output", testMachineReadableOutput},
     };
 
     std::string_view currentTest;

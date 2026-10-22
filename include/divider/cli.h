@@ -12,6 +12,13 @@
 namespace divider
 {
 
+    enum class OutputFormat
+    {
+        Table,
+        Csv,
+        Json,
+    };
+
     struct Options
     {
         bool help = false;
@@ -30,7 +37,12 @@ namespace divider
         Range lowRange;
         std::optional<double> maxErrorPercent;
         std::optional<double> loadResistance;
+        std::optional<double> ratedPower;
+        std::optional<double> deratePercent;
+        OutputFormat format = OutputFormat::Table;
         std::vector<int> selectedSeries;
+        std::vector<int> highSeries;
+        std::vector<int> lowSeries;
         std::map<int, double> toleranceOverridesPercent;
     };
 

@@ -19,7 +19,8 @@ namespace divider
     struct SearchConfig
     {
         double targetRatio = 0.0;
-        double tolerancePercent = 0.0;
+        double tolerancePercent = 0.0; // Upper resistor tolerance; also the lower one unless lowTolerancePercent is set.
+        std::optional<double> lowTolerancePercent;
         double factor = 0.5;
         std::size_t top = 10;
         Range seriesRange;
@@ -29,6 +30,7 @@ namespace divider
         Range lowRange;
         std::optional<double> maxErrorPercent;
         std::optional<double> loadResistance;
+        std::optional<double> ratedPower; // Maximum worst-case power allowed in each resistor; requires VIN.
         std::optional<double> vin;
         std::optional<double> vout;
     };
@@ -52,10 +54,13 @@ namespace divider
         double power = 0.0; // Total power in the two divider resistors, excluding the load.
         double powerHigh = 0.0;
         double powerLow = 0.0;
+        double powerHighMax = 0.0; // Worst-case power in the upper resistor over both tolerances.
+        double powerLowMax = 0.0;  // Worst-case power in the lower resistor over both tolerances.
         double voutMin = 0.0;
         double voutMax = 0.0;
     };
 
     std::vector<DividerCandidate> findBestCandidates(const std::vector<double>& resistorValues, const SearchConfig& config);
+    std::vector<DividerCandidate> findBestCandidates(const std::vector<double>& highValues, const std::vector<double>& lowValues, const SearchConfig& config);
 
 } // namespace divider

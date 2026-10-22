@@ -9,6 +9,9 @@ A C++20 command-line tool for finding resistor pairs from E series that approxim
 - Filters for individual resistors, total resistance, parallel equivalent, power, and maximum error across tolerance extremes.
 - Output voltage limits, errors, and nominal power dissipation for each resistor.
 - Configurable precision with `--digits` and interval pruning to accelerate filtered searches.
+- Different E series, and therefore different tolerances, for the upper and lower resistor.
+- Worst-case power per resistor over the tolerance range, with a power-rating filter and optional derating.
+- Table, CSV, or JSON output.
 
 ## Get the project
 
@@ -56,7 +59,7 @@ With `--load OHMS`, a fixed resistive load is connected between VOUT and ground.
 
 Nominal resistor power is calculated as `(VIN - VOUT)² / R_high` and `VOUT² / R_low`, using the actual nominal output voltage. With a load, `P_total` is the sum of these two powers and excludes load dissipation. These are nominal powers, not worst-case values under tolerance.
 
-Both resistors belong to the same E series. The search covers values from `10 µΩ` to `10 TΩ`; use filters to restrict candidates to practical ranges for your circuit.
+By default both resistors belong to the same E series; `--E-high` and `--E-low` choose a different series for each. The search covers values from `10 µΩ` to `10 TΩ`; use filters to restrict candidates to practical ranges for your circuit.
 
 ## Quick start
 
@@ -66,6 +69,7 @@ In PowerShell, with the compiled executable in the project directory:
 .\divider.exe --help
 .\divider.exe --ratio 0.275 --top 5 --E 96 192 --series 1k 1M
 .\divider.exe --vin-vout 12 3.3 --top 3 --parallel 1k 100k --power 1m 100m
+.\divider.exe --ratio 0.275 --vin 24 --E-high 96 --E-low 24 --rating 125m --derate 50 --top 3
 ```
 
 The second command searches for a ratio of `0.275` using E96 and E192, with total resistance between `1 kΩ` and `1 MΩ`. The third targets `3.3 V` from `12 V`, with parallel equivalent resistance between `1 kΩ` and `100 kΩ` and total resistor power between `1 mW` and `100 mW`.
@@ -79,12 +83,17 @@ Specify exactly one target mode:
 | `--ratio RATIO` | Target `VOUT / VIN`, strictly between 0 and 1. |
 | `--vin-vout VIN VOUT` | Voltages in volts; requires `VIN > VOUT > 0`. |
 
+`--ratio` can be combined with `--vin VIN` (volts, positive) to define the target voltage `VOUT = RATIO * VIN`. This enables the voltage columns, `--power`, and `--rating`. `--vin` cannot be combined with `--vin-vout`.
+
 Search and display options:
 
 | Option | Description | Default |
 | --- | --- | --- |
 | `--top N` | Maximum number of candidates per series; a positive integer. | `10` |
 | `--E LIST` | Space-separated series, such as `--E 24 96`. Also accepts `E24` and `E96`. | All series |
+| `--E-high LIST` | Series for the upper resistor. If given, every combination of upper and lower series is evaluated. | `--E`, else all series |
+| `--E-low LIST` | Series for the lower resistor, with the same behavior. | `--E`, else all series |
+| `--format FORMAT` | `table`, `csv`, or `json`. | `table` |
 | `--factor F` | Weight of nominal error in the ranking, from 0 to 1. | `0.5` |
 | `--digits N` | Sets 0 to 9 decimal places in all numeric columns after SI scaling. | Automatic |
 | `--load OHMS` | Fixed load resistance between VOUT and ground; must be positive. Available in both target modes. | No load |
@@ -99,7 +108,9 @@ Filters use inclusive limits:
 | `--max-error PCT` | Maximum absolute percentage error at both tolerance extremes; zero is allowed. |
 | `--series MIN MAX` | Total resistance `R_high + R_low` in ohms; both limits must be positive. |
 | `--parallel MIN MAX` | Parallel equivalent of `R_high` and `R_low` in ohms; both limits must be positive. |
-| `--power MIN MAX` | Total nominal power in both resistors in watts, excluding the load. Requires `--vin-vout`; a zero minimum is allowed. |
+| `--power MIN MAX` | Total nominal power in both resistors in watts, excluding the load. Requires `--vin-vout` or `--vin`; a zero minimum is allowed. |
+| `--rating WATTS` | Maximum worst-case power allowed in each resistor, in watts. Requires `--vin-vout` or `--vin`. |
+| `--derate PCT` | With `--rating`, the limit becomes `WATTS * (1 - PCT / 100)`; `0 <= PCT < 100`. Default: `0`. |
 
 For every interval filter, the minimum must not exceed the maximum.
 
@@ -110,6 +121,27 @@ Example with a load, individual resistor limits, and a maximum error of ±1%:
 ```
 
 The `--max-error` filter requires the entire tolerance interval to stay within the specified percentage of the target. A narrow interval far from the target does not pass. Resistance and power limits apply to nominal values.
+
+## Different series for each resistor
+
+`--E-high` and `--E-low` pick the series of each resistor independently, and each resistor uses the tolerance of its own series (including `--E24 PCT`-style overrides). One table is printed per combination:
+
+```powershell
+.\divider.exe --ratio 0.275 --E-high 96 --E-low 24 12 --top 3
+```
+
+This evaluates E96/E24 and E96/E12, with the E96 resistor on top. If only one of the two options is given, the other falls back to `--E`, and then to all series. Without either option, both resistors share one series, as before.
+
+## Worst-case power and ratings
+
+With a known `VIN`, the tool computes the worst-case power in each resistor over the whole tolerance range. With `B` the lower leg (including the load, if any):
+
+```text
+P_high = VIN² * R_high / (R_high + B)²        largest at the lowest B; peaks at R_high = B
+P_low  = VOUT² / R_low                        largest at the lowest R_high; peaks at R_low = R_high || load
+```
+
+Each expression has a single maximum, so the worst case is exact: the peak is clamped into the tolerance interval. `--rating WATTS` keeps only dividers where both worst-case powers are at most `WATTS * (1 - derate / 100)`, and the table adds `top max power` and `bottom max power` columns. The `--power` filter and the `power` columns remain nominal.
 
 ## E series and tolerances
 
@@ -170,6 +202,10 @@ A table is printed for each selected series:
 
 Values use SI prefixes. Without `--digits`, formatting is automatic for each column; with `--digits`, the requested precision applies throughout the table. If no pair in a series satisfies the filters, the program prints `No candidates found.`.
 
+## CSV and JSON output
+
+`--format csv` prints one header and one row per candidate. `--format json` prints `{"results": [...]}` with one entry per series combination. Both use base units (ohms, volts, watts, percent) with 12 significant digits, no SI prefixes, and ignore `--digits`. Fields: `rank`, `high_series`, `low_series`, `high_tolerance_pct`, `low_tolerance_pct`, `r_high_ohm`, `r_low_ohm`, `r_series_ohm`, `r_parallel_ohm`, `ratio`, `ratio_min`, `ratio_max`, `nominal_error_pct`, `error_min_pct`, `error_max_pct`. With a voltage target they add `vout_min_v`, `vout_max_v`, `nominal_error_v`, `error_min_v`, `error_max_v`, `power_w`, `power_high_w`, `power_low_w`, `power_high_max_w`, and `power_low_max_w`.
+
 ## Input units
 
 Use a decimal point and omit unit suffixes: `3.3`, `10k`, `1M`, or `100m`. Resistance is in ohms, voltage in volts, and power in watts.
@@ -218,11 +254,11 @@ ctest --test-dir build --output-on-failure
 ./build/divider --help
 ```
 
-The suite includes 36 test cases covering loaded and unloaded calculations, tolerance extremes, inclusive filters, numeric validation, CLI options, and output formatting. It also compares optimized searches against exhaustive evaluation across a matrix of configurations.
+The suite includes 42 test cases covering loaded and unloaded calculations, independent tolerances, worst-case power (checked against a dense grid), CSV and JSON output, tolerance extremes, inclusive filters, numeric validation, CLI options, and output formatting. It also compares optimized searches against exhaustive evaluation across a matrix of configurations.
 
 ## Model assumptions
 
-Both resistors use the same tolerance, and the load is treated as fixed. Displayed powers and the power filter use nominal values rather than worst-case dissipation under tolerances.
+Each resistor uses the tolerance of its series (the same one when both come from one series), and the load is treated as fixed. The `power` columns and the `--power` filter use nominal values; `--rating` and the `max power` columns use the worst case over tolerances. Temperature drift and aging are not modeled.
 
 ## Project structure
 

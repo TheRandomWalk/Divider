@@ -5,7 +5,9 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <iomanip>
 #include <iostream>
+#include <locale>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -283,9 +285,19 @@ namespace divider
 
     } // namespace
 
-    void printSeriesTable(std::ostream& output, std::string_view seriesName, int seriesValue, double tolerancePercent, const std::vector<DividerCandidate>& candidates, int digits, bool includeVoltageColumns, bool fixedDigits)
+    void printPairTable(std::ostream& output, const SeriesResult& result, int digits, bool includeVoltageColumns, bool fixedDigits, bool includeWorstPowerColumns)
     {
-        output << "\n" << seriesName << " (tolerance +/-" << formatCompactDecimal(tolerancePercent) << "%)\n";
+        const std::vector<DividerCandidate>& candidates = result.candidates;
+        const int columnSeriesValue = std::max(result.highValueCount, result.lowValueCount);
+
+        if (result.highName == result.lowName)
+        {
+            output << "\n" << result.highName << " (tolerance +/-" << formatCompactDecimal(result.highTolerancePercent) << "%)\n";
+        }
+        else
+        {
+            output << "\ntop " << result.highName << " (+/-" << formatCompactDecimal(result.highTolerancePercent) << "%) / bottom " << result.lowName << " (+/-" << formatCompactDecimal(result.lowTolerancePercent) << "%)\n";
+        }
 
         if (candidates.empty())
         {
@@ -303,6 +315,11 @@ namespace divider
             headers.push_back("error range (V)");
             for (const char* header : {"VOUT min (V)", "VOUT max (V)", "top power (W)", "bottom power (W)"})
                 headers.push_back(header);
+            if (includeWorstPowerColumns)
+            {
+                headers.push_back("top max power (W)");
+                headers.push_back("bottom max power (W)");
+            }
         }
         else
         {
@@ -314,8 +331,8 @@ namespace divider
 
         const int percentErrorDigits = digits;
         const auto precision = [fixedDigits, digits](int automatic) { return fixedDigits ? digits : automatic; };
-        const ColumnFormat seriesColumn = resistanceColumnFormat(candidates, seriesValue, &DividerCandidate::rSeries);
-        const ColumnFormat parallelColumn = resistanceColumnFormat(candidates, seriesValue, &DividerCandidate::rParallel);
+        const ColumnFormat seriesColumn = resistanceColumnFormat(candidates, columnSeriesValue, &DividerCandidate::rSeries);
+        const ColumnFormat parallelColumn = resistanceColumnFormat(candidates, columnSeriesValue, &DividerCandidate::rParallel);
         const ColumnFormat powerColumn = includeVoltageColumns ? powerColumnFormat(candidates) : ColumnFormat{SiScale{1.0, ""}, 0};
         const ColumnFormat nominalVoltageColumn = includeVoltageColumns ? nominalVoltageColumnFormat(candidates) : ColumnFormat{SiScale{1.0, ""}, 0};
         const ColumnFormat voltageRangeColumn = includeVoltageColumns ? voltageRangeColumnFormat(candidates) : ColumnFormat{SiScale{1.0, ""}, 0};
@@ -324,8 +341,8 @@ namespace divider
         {
             const SiScale highScale = chooseSiScale(candidate.rHigh);
             const SiScale lowScale = chooseSiScale(candidate.rLow);
-            const int highDigits = resistanceDigits(seriesValue, candidate.rHigh, highScale);
-            const int lowDigits = resistanceDigits(seriesValue, candidate.rLow, lowScale);
+            const int highDigits = resistanceDigits(result.highValueCount, candidate.rHigh, highScale);
+            const int lowDigits = resistanceDigits(result.lowValueCount, candidate.rLow, lowScale);
 
             Row row;
             row.cells.push_back(formatSiValueWithScale(candidate.rHigh, highScale, precision(highDigits)));
@@ -340,7 +357,13 @@ namespace divider
                 row.cells.push_back(formatDecimal(ratioErrorRangePercent(candidate), percentErrorDigits));
                 row.cells.push_back(formatSignedSiValueWithScale(candidate.nominalVoltageError, nominalVoltageColumn.scale, precision(nominalVoltageColumn.digits)));
                 row.cells.push_back(formatSiValueWithScale(voltageErrorRange(candidate), voltageRangeColumn.scale, precision(voltageRangeColumn.digits)));
-                for (double value : {candidate.voutMin, candidate.voutMax, candidate.powerHigh, candidate.powerLow})
+                std::vector<double> extraValues{candidate.voutMin, candidate.voutMax, candidate.powerHigh, candidate.powerLow};
+                if (includeWorstPowerColumns)
+                {
+                    extraValues.push_back(candidate.powerHighMax);
+                    extraValues.push_back(candidate.powerLowMax);
+                }
+                for (double value : extraValues)
                 {
                     const SiScale scale = chooseSiScale(value);
                     row.cells.push_back(formatSiValueWithScale(value, scale, precision(decimalDigitsForSignificantDigits(value, scale, 3))));
@@ -372,6 +395,128 @@ namespace divider
         {
             printRow(output, row.cells, widths, true);
         }
+    }
+
+
+    void printSeriesTable(std::ostream& output, std::string_view seriesName, int seriesValue, double tolerancePercent, const std::vector<DividerCandidate>& candidates, int digits, bool includeVoltageColumns, bool fixedDigits, bool includeWorstPowerColumns)
+    {
+        SeriesResult result;
+        result.highName = std::string(seriesName);
+        result.lowName = result.highName;
+        result.highValueCount = seriesValue;
+        result.lowValueCount = seriesValue;
+        result.highTolerancePercent = tolerancePercent;
+        result.lowTolerancePercent = tolerancePercent;
+        result.candidates = candidates;
+        printPairTable(output, result, digits, includeVoltageColumns, fixedDigits, includeWorstPowerColumns);
+    }
+
+    namespace
+    {
+
+        struct Field
+        {
+            const char* name;
+            double (*get)(const DividerCandidate&);
+            bool voltageOnly;
+        };
+
+        const std::vector<Field>& machineFields()
+        {
+            static const std::vector<Field> fields{
+                {"r_high_ohm", [](const DividerCandidate& c) { return c.rHigh; }, false},
+                {"r_low_ohm", [](const DividerCandidate& c) { return c.rLow; }, false},
+                {"r_series_ohm", [](const DividerCandidate& c) { return c.rSeries; }, false},
+                {"r_parallel_ohm", [](const DividerCandidate& c) { return c.rParallel; }, false},
+                {"ratio", [](const DividerCandidate& c) { return c.ratio; }, false},
+                {"ratio_min", [](const DividerCandidate& c) { return c.ratioLow; }, false},
+                {"ratio_max", [](const DividerCandidate& c) { return c.ratioHigh; }, false},
+                {"nominal_error_pct", [](const DividerCandidate& c) { return c.nominalRatioErrorPercent; }, false},
+                {"error_min_pct", [](const DividerCandidate& c) { return c.lowRatioErrorPercent; }, false},
+                {"error_max_pct", [](const DividerCandidate& c) { return c.highRatioErrorPercent; }, false},
+                {"vout_min_v", [](const DividerCandidate& c) { return c.voutMin; }, true},
+                {"vout_max_v", [](const DividerCandidate& c) { return c.voutMax; }, true},
+                {"nominal_error_v", [](const DividerCandidate& c) { return c.nominalVoltageError; }, true},
+                {"error_min_v", [](const DividerCandidate& c) { return c.lowVoltageError; }, true},
+                {"error_max_v", [](const DividerCandidate& c) { return c.highVoltageError; }, true},
+                {"power_w", [](const DividerCandidate& c) { return c.power; }, true},
+                {"power_high_w", [](const DividerCandidate& c) { return c.powerHigh; }, true},
+                {"power_low_w", [](const DividerCandidate& c) { return c.powerLow; }, true},
+                {"power_high_max_w", [](const DividerCandidate& c) { return c.powerHighMax; }, true},
+                {"power_low_max_w", [](const DividerCandidate& c) { return c.powerLowMax; }, true},
+            };
+            return fields;
+        }
+
+        // Machine-readable numbers use base units and 12 significant digits, independent of the locale.
+        std::string machineNumber(double value)
+        {
+            std::ostringstream text;
+            text.imbue(std::locale::classic());
+            text << std::setprecision(12) << value;
+            return text.str();
+        }
+
+    } // namespace
+
+    void printCsv(std::ostream& output, const std::vector<SeriesResult>& results, bool includeVoltageColumns)
+    {
+        output << "rank,high_series,low_series,high_tolerance_pct,low_tolerance_pct";
+        for (const auto& field : machineFields())
+        {
+            if (includeVoltageColumns || !field.voltageOnly)
+            {
+                output << ',' << field.name;
+            }
+        }
+        output << '\n';
+
+        for (const auto& result : results)
+        {
+            std::size_t rank = 0;
+            for (const auto& candidate : result.candidates)
+            {
+                output << ++rank << ',' << result.highName << ',' << result.lowName << ',' << machineNumber(result.highTolerancePercent) << ',' << machineNumber(result.lowTolerancePercent);
+                for (const auto& field : machineFields())
+                {
+                    if (includeVoltageColumns || !field.voltageOnly)
+                    {
+                        output << ',' << machineNumber(field.get(candidate));
+                    }
+                }
+                output << '\n';
+            }
+        }
+    }
+
+    void printJson(std::ostream& output, const std::vector<SeriesResult>& results, bool includeVoltageColumns)
+    {
+        output << "{\n  \"results\": [";
+        for (std::size_t resultIndex = 0; resultIndex < results.size(); ++resultIndex)
+        {
+            const auto& result = results[resultIndex];
+            output << (resultIndex > 0 ? ",\n" : "\n") << "    {\n"
+                   << "      \"high_series\": \"" << result.highName << "\",\n"
+                   << "      \"low_series\": \"" << result.lowName << "\",\n"
+                   << "      \"high_tolerance_pct\": " << machineNumber(result.highTolerancePercent) << ",\n"
+                   << "      \"low_tolerance_pct\": " << machineNumber(result.lowTolerancePercent) << ",\n"
+                   << "      \"candidates\": [";
+
+            for (std::size_t index = 0; index < result.candidates.size(); ++index)
+            {
+                output << (index > 0 ? ",\n" : "\n") << "        {\"rank\": " << index + 1;
+                for (const auto& field : machineFields())
+                {
+                    if (includeVoltageColumns || !field.voltageOnly)
+                    {
+                        output << ", \"" << field.name << "\": " << machineNumber(field.get(result.candidates[index]));
+                    }
+                }
+                output << '}';
+            }
+            output << (result.candidates.empty() ? "]\n" : "\n      ]\n") << "    }";
+        }
+        output << (results.empty() ? "]\n}\n" : "\n  ]\n}\n");
     }
 
 } // namespace divider

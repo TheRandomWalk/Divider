@@ -1,5 +1,7 @@
 #include "divider/cli.h"
 #include "divider/e_series.h"
+#include "divider/machine_output.h"
+#include "divider/runner.h"
 #include "divider/search.h"
 #include "divider/si.h"
 #include "divider/table.h"
@@ -815,6 +817,52 @@ namespace
         expectTrue(options.selectedSeries[2] == 3, "Expected E3 third.");
     }
 
+    void testFindSeries()
+    {
+        for (const auto& series : divider::allSeries())
+        {
+            const auto* found = divider::findSeries(series.valueCount);
+            expectTrue(found == &series, "Expected findSeries to return the matching definition.");
+        }
+        expectTrue(divider::findSeries(7) == nullptr, "Expected unsupported series to be null.");
+        expectTrue(divider::findSeries(0) == nullptr, "Expected zero to be unsupported.");
+    }
+
+    void testRunnerSeriesPairs()
+    {
+        const auto all = divider::selectSeriesPairs(parseArgs({"divider", "--ratio", "0.5"}));
+        expectTrue(all.size() == divider::allSeries().size(), "Expected one pair per series.");
+        expectTrue(all.front().high == all.front().low, "Expected the same series on both resistors.");
+
+        const auto mixed = divider::selectSeriesPairs(parseArgs({"divider", "--ratio", "0.5", "--E", "6", "--E-high", "96", "24"}));
+        expectTrue(mixed.size() == 2, "Expected the upper list to combine with the --E fallback.");
+        expectTrue(mixed[0].high->valueCount == 24 && mixed[0].low->valueCount == 6, "Expected pairs in allSeries() order.");
+        expectTrue(mixed[1].high->valueCount == 96 && mixed[1].low->valueCount == 6, "Expected the E96 pair second.");
+    }
+
+    void testRunnerSearchConfig()
+    {
+        const auto options = parseArgs({"divider", "--ratio", "0.3", "--vin", "10", "--rating", "0.5", "--derate", "20", "--E96", "2"});
+        const divider::SeriesPair pair{divider::findSeries(96), divider::findSeries(24)};
+        const auto config = divider::makeSearchConfig(options, pair);
+        expectNear(config.tolerancePercent, 2.0);
+        expectNear(*config.lowTolerancePercent, 5.0);
+        expectNear(*config.ratedPower, 0.4);
+        expectNear(*config.vin, 10.0);
+        expectNear(*config.vout, 3.0);
+    }
+
+    void testRunnerWritesRequestedFormat()
+    {
+        std::ostringstream csv;
+        divider::run(parseArgs({"divider", "--ratio", "0.5", "--E", "12", "--top", "2", "--format", "csv"}), csv);
+        expectTrue(csv.str().rfind("rank,high_series", 0) == 0, "Expected CSV header first.");
+
+        std::ostringstream table;
+        divider::run(parseArgs({"divider", "--ratio", "0.5", "--E", "12", "--top", "2"}), table);
+        expectTrue(table.str().find("E12 (tolerance +/-10%)") != std::string::npos, "Expected a table heading.");
+    }
+
     void testCliValidationErrors()
     {
         expectThrows(
@@ -1166,6 +1214,10 @@ int main()
         {"CLI defaults and help", testCliDefaultsAndHelp},
         {"CLI series selection", testCliSeriesSelection},
         {"CLI series selection accepts names and deduplicates", testCliSeriesSelectionAcceptsNamesAndDeduplicates},
+        {"series lookup", testFindSeries},
+        {"runner series pairs", testRunnerSeriesPairs},
+        {"runner search config", testRunnerSearchConfig},
+        {"runner output format", testRunnerWritesRequestedFormat},
         {"CLI validation errors", testCliValidationErrors},
         {"independent tolerances and value lists", testIndependentToleranceAndValueLists},
         {"mixed search matches exhaustive", testMixedSearchMatchesExhaustive},

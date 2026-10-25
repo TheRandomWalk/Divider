@@ -45,11 +45,6 @@ namespace divider
             return std::round(value * scale) / scale;
         }
 
-        bool isSupportedSeries(int valueCount)
-        {
-            return valueCount == 3 || valueCount == 6 || valueCount == 12 || valueCount == 24 || valueCount == 48 || valueCount == 96 || valueCount == 192;
-        }
-
     } // namespace
 
     const std::vector<SeriesDefinition>& allSeries()
@@ -60,9 +55,16 @@ namespace divider
         return series;
     }
 
+    const SeriesDefinition* findSeries(int valueCount)
+    {
+        const auto& series = allSeries();
+        const auto found = std::find_if(series.begin(), series.end(), [valueCount](const SeriesDefinition& definition) { return definition.valueCount == valueCount; });
+        return found != series.end() ? &*found : nullptr;
+    }
+
     std::vector<double> generateBaseValues(int valueCount)
     {
-        if (!isSupportedSeries(valueCount))
+        if (!findSeries(valueCount))
         {
             throw std::invalid_argument("Unsupported E series.");
         }
@@ -104,7 +106,8 @@ namespace divider
         }
 
         std::sort(values.begin(), values.end());
-        values.erase(std::unique(values.begin(), values.end(), [](double left, double right) {return std::abs(left - right) <= std::max(std::abs(left), std::abs(right)) * 1.0e-12;}), values.end());
+        const auto nearlyEqual = [](double left, double right) { return std::abs(left - right) <= std::max(std::abs(left), std::abs(right)) * 1.0e-12; };
+        values.erase(std::unique(values.begin(), values.end(), nearlyEqual), values.end());
 
         return values;
     }

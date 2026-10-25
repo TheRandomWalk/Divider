@@ -4,12 +4,20 @@
 #include <cmath>
 #include <queue>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace divider
 {
     namespace
     {
+
+        using ValueIterator = std::vector<double>::const_iterator;
+
+        bool isFinite(double value)
+        {
+            return std::isfinite(value);
+        }
 
         bool betterCandidate(const DividerCandidate& left, const DividerCandidate& right)
         {
@@ -34,6 +42,7 @@ namespace divider
             return left.rLow < right.rLow;
         }
 
+        // Heap comparator that keeps the worst retained candidate on top.
         struct WorstFirst
         {
             bool operator()(const DividerCandidate& left, const DividerCandidate& right) const
@@ -48,85 +57,264 @@ namespace divider
             return small / (1.0 + small / std::max(rHigh, rLow));
         }
 
+        double ratioErrorPercent(double ratio, double targetRatio)
+        {
+            return ((ratio - targetRatio) / targetRatio) * 100.0;
+        }
+
         double scoreError(double nominalErrorPercent, double lowErrorPercent, double highErrorPercent, double factor)
         {
             return std::abs(nominalErrorPercent) * factor + (std::abs(highErrorPercent) + std::abs(lowErrorPercent)) * (1.0 - factor);
         }
 
-        double clampValue(double value, double low, double high)
+        // The divider output ratio, with an optional fixed load across the lower resistor.
+        struct DividerModel
         {
-            return std::min(std::max(value, low), high);
+            std::optional<double> load;
+
+            double bottom(double rLow) const
+            {
+                return load ? parallelResistance(rLow, *load) : rLow;
+            }
+
+            double ratio(double rHigh, double rLow) const
+            {
+                const double effectiveLow = bottom(rLow);
+                return effectiveLow / (rHigh + effectiveLow);
+            }
+        };
+
+        // Everything about a search that does not change from one candidate to the next.
+        struct SearchContext
+        {
+            const SearchConfig& config;
+            DividerModel model;
+            double highTolerance;
+            double lowTolerance;
+        };
+
+        // Resistor limits over the tolerance interval.
+        struct Extremes
+        {
+            double highMin;
+            double highMax;
+            double lowMin;
+            double lowMax;
+        };
+
+        Extremes toleranceExtremes(double rHigh, double rLow, const SearchContext& context)
+        {
+            return Extremes{
+                rHigh * (1.0 - context.highTolerance),
+                rHigh * (1.0 + context.highTolerance),
+                rLow * (1.0 - context.lowTolerance),
+                rLow * (1.0 + context.lowTolerance),
+            };
         }
 
-        DividerCandidate makeCandidate(double rHigh, double rLow, double targetRatio, double highTolerancePercent, double lowTolerancePercent, double factor, std::optional<double> vin, std::optional<double> vout, std::optional<double> load)
+        // Fills the nominal and tolerance-extreme voltage errors, VOUT range and nominal power for one candidate.
+        void fillVoltageAndPower(DividerCandidate& candidate, double vin, double vout, const SearchContext& context)
         {
-            const double rSeries = rHigh + rLow;
-            const auto effectiveLow = [load](double resistance)
-            {
-                return load ? parallelResistance(resistance, *load) : resistance;
-            };
-            const auto dividerRatio = [&effectiveLow](double high, double low)
-            {
-                const double bottom = effectiveLow(low);
-                return bottom / (high + bottom);
-            };
-            const double ratio = dividerRatio(rHigh, rLow);
-            const double nominalRatioErrorPercent = ((ratio - targetRatio) / targetRatio) * 100.0;
-            const double highTolerance = highTolerancePercent / 100.0;
-            const double lowTolerance = lowTolerancePercent / 100.0;
-            const double rHighMax = rHigh * (1.0 + highTolerance);
-            const double rHighMin = rHigh * (1.0 - highTolerance);
-            const double rLowMax = rLow * (1.0 + lowTolerance);
-            const double rLowMin = rLow * (1.0 - lowTolerance);
-            const double ratioLow = dividerRatio(rHighMax, rLowMin);
-            const double ratioHigh = dividerRatio(rHighMin, rLowMax);
-            const double lowRatioErrorPercent = ((ratioLow - targetRatio) / targetRatio) * 100.0;
-            const double highRatioErrorPercent = ((ratioHigh - targetRatio) / targetRatio) * 100.0;
+            candidate.nominalVoltageError = (vin * candidate.ratio) - vout;
+            candidate.lowVoltageError = (vin * candidate.ratioLow) - vout;
+            candidate.highVoltageError = (vin * candidate.ratioHigh) - vout;
+            candidate.voutMin = vin * candidate.ratioLow;
+            candidate.voutMax = vin * candidate.ratioHigh;
+
+            const double output = vin * candidate.ratio;
+            const double dropHigh = vin - output;
+            candidate.powerHigh = dropHigh * (dropHigh / candidate.rHigh);
+            candidate.powerLow = output * (output / candidate.rLow);
+            candidate.power = context.model.load ? candidate.powerHigh + candidate.powerLow : vin * (vin / candidate.rSeries);
+        }
+
+        // Worst case per resistor, with B the effective lower leg. P_high = VIN^2 * Rh / (Rh + B)^2 falls as B
+        // grows, so B is taken at its minimum and Rh peaks at Rh = B. P_low = Vout^2 / Rl falls as Rh grows, so
+        // Rh is taken at its minimum and Rl peaks at Rl = Rh || load. Each function has a single maximum, so
+        // clamping the peak into the tolerance interval gives the exact worst case.
+        void fillWorstCasePower(DividerCandidate& candidate, double vin, const Extremes& extremes, const SearchContext& context)
+        {
+            const DividerModel& model = context.model;
+
+            const double bottomMin = model.bottom(extremes.lowMin);
+            const double highAtPeak = std::clamp(bottomMin, extremes.highMin, extremes.highMax);
+            candidate.powerHighMax = vin * vin * highAtPeak / ((highAtPeak + bottomMin) * (highAtPeak + bottomMin));
+
+            const double lowPeak = model.load ? parallelResistance(extremes.highMin, *model.load) : extremes.highMin;
+            const double lowAtPeak = std::clamp(lowPeak, extremes.lowMin, extremes.lowMax);
+            const double bottomAtPeak = model.bottom(lowAtPeak);
+            const double outputAtPeak = vin * bottomAtPeak / (extremes.highMin + bottomAtPeak);
+            candidate.powerLowMax = outputAtPeak * outputAtPeak / lowAtPeak;
+        }
+
+        DividerCandidate makeCandidate(double rHigh, double rLow, const SearchContext& context)
+        {
+            const SearchConfig& config = context.config;
+            const DividerModel& model = context.model;
+            const Extremes extremes = toleranceExtremes(rHigh, rLow, context);
 
             DividerCandidate candidate;
-
             candidate.rHigh = rHigh;
             candidate.rLow = rLow;
-            candidate.rSeries = rSeries;
+            candidate.rSeries = rHigh + rLow;
             candidate.rParallel = parallelResistance(rHigh, rLow);
-            candidate.ratio = ratio;
-            candidate.ratioLow = ratioLow;
-            candidate.ratioHigh = ratioHigh;
-            candidate.nominalRatioErrorPercent = nominalRatioErrorPercent;
-            candidate.lowRatioErrorPercent = lowRatioErrorPercent;
-            candidate.highRatioErrorPercent = highRatioErrorPercent;
-            candidate.ratioErrorScorePercent = scoreError(nominalRatioErrorPercent, lowRatioErrorPercent, highRatioErrorPercent, factor);
+            candidate.ratio = model.ratio(rHigh, rLow);
+            candidate.ratioLow = model.ratio(extremes.highMax, extremes.lowMin);
+            candidate.ratioHigh = model.ratio(extremes.highMin, extremes.lowMax);
+            candidate.nominalRatioErrorPercent = ratioErrorPercent(candidate.ratio, config.targetRatio);
+            candidate.lowRatioErrorPercent = ratioErrorPercent(candidate.ratioLow, config.targetRatio);
+            candidate.highRatioErrorPercent = ratioErrorPercent(candidate.ratioHigh, config.targetRatio);
+            candidate.ratioErrorScorePercent = scoreError(candidate.nominalRatioErrorPercent, candidate.lowRatioErrorPercent, candidate.highRatioErrorPercent, config.factor);
 
-            if (vin && vout)
+            if (config.vin && config.vout)
             {
-                candidate.nominalVoltageError = (*vin * ratio) - *vout;
-                candidate.lowVoltageError = (*vin * ratioLow) - *vout;
-                candidate.highVoltageError = (*vin * ratioHigh) - *vout;
-                candidate.voutMin = *vin * ratioLow;
-                candidate.voutMax = *vin * ratioHigh;
-                const double output = *vin * ratio;
-                const double dropHigh = *vin - output;
-                candidate.powerHigh = dropHigh * (dropHigh / rHigh);
-                candidate.powerLow = output * (output / rLow);
-                candidate.power = load ? candidate.powerHigh + candidate.powerLow : *vin * (*vin / rSeries);
-
-                // Worst case per resistor, with B the effective lower leg. P_high = VIN^2 * Rh / (Rh + B)^2 falls as B
-                // grows, so B is taken at its minimum and Rh peaks at Rh = B. P_low = Vout^2 / Rl falls as Rh grows, so
-                // Rh is taken at its minimum and Rl peaks at Rl = Rh || load. Each function has a single maximum, so
-                // clamping the peak into the tolerance interval gives the exact worst case.
-                const double bottomMin = effectiveLow(rLowMin);
-                const double highAtPeak = clampValue(bottomMin, rHighMin, rHighMax);
-                candidate.powerHighMax = *vin * *vin * highAtPeak / ((highAtPeak + bottomMin) * (highAtPeak + bottomMin));
-                const double lowPeak = load ? parallelResistance(rHighMin, *load) : rHighMin;
-                const double lowAtPeak = clampValue(lowPeak, rLowMin, rLowMax);
-                const double bottomAtPeak = effectiveLow(lowAtPeak);
-                const double outputAtPeak = *vin * bottomAtPeak / (rHighMin + bottomAtPeak);
-                candidate.powerLowMax = outputAtPeak * outputAtPeak / lowAtPeak;
-                if (!std::isfinite(candidate.power) || !std::isfinite(candidate.powerHigh) || !std::isfinite(candidate.powerLow))
+                fillVoltageAndPower(candidate, *config.vin, *config.vout, context);
+                fillWorstCasePower(candidate, *config.vin, extremes, context);
+                if (!isFinite(candidate.power) || !isFinite(candidate.powerHigh) || !isFinite(candidate.powerLow))
+                {
                     throw std::invalid_argument("Power calculation out of range; reduce VIN or increase resistance.");
+                }
             }
 
             return candidate;
+        }
+
+        bool validPercent(double value)
+        {
+            return isFinite(value) && value >= 0.0 && value < 100.0;
+        }
+
+        void validateConfig(const SearchConfig& config)
+        {
+            if (config.powerRange.enabled && !config.vin)
+            {
+                throw std::invalid_argument("Power filtering requires VIN.");
+            }
+            if (config.ratedPower && !config.vin)
+            {
+                throw std::invalid_argument("Rated power filtering requires VIN.");
+            }
+            if (config.ratedPower && (!isFinite(*config.ratedPower) || *config.ratedPower <= 0.0))
+            {
+                throw std::invalid_argument("Invalid rated power.");
+            }
+
+            if (!isFinite(config.targetRatio) || config.targetRatio <= 0.0 || config.targetRatio >= 1.0 || !validPercent(config.tolerancePercent) ||
+                (config.lowTolerancePercent && !validPercent(*config.lowTolerancePercent)) || !isFinite(config.factor) || config.factor < 0.0 || config.factor > 1.0)
+            {
+                throw std::invalid_argument("Invalid search target, tolerance or factor.");
+            }
+            if (config.loadResistance && (!isFinite(*config.loadResistance) || *config.loadResistance <= 0.0))
+            {
+                throw std::invalid_argument("Invalid load resistance.");
+            }
+            if (config.maxErrorPercent && (!isFinite(*config.maxErrorPercent) || *config.maxErrorPercent < 0.0))
+            {
+                throw std::invalid_argument("Invalid maximum error.");
+            }
+            if (config.vin.has_value() != config.vout.has_value() || (config.vin && (!isFinite(*config.vin) || !isFinite(*config.vout) || *config.vout <= 0.0 || *config.vin <= *config.vout)))
+            {
+                throw std::invalid_argument("Invalid voltage pair.");
+            }
+            for (const Range* range : {&config.seriesRange, &config.parallelRange, &config.highRange, &config.lowRange, &config.powerRange})
+            {
+                const bool allowsZeroMinimum = range == &config.powerRange;
+                if (range->enabled && (!isFinite(range->min) || !isFinite(range->max) || range->min > range->max || range->min < 0.0 || (!allowsZeroMinimum && range->min == 0.0)))
+                {
+                    throw std::invalid_argument("Invalid search range.");
+                }
+            }
+        }
+
+        // Sorted, de-duplicated copy of the resistor values.
+        std::vector<double> prepareValues(const std::vector<double>& source)
+        {
+            std::vector<double> prepared = source;
+            for (const double value : prepared)
+            {
+                if (!isFinite(value) || value <= 0.0 || value > 1.0e150)
+                {
+                    throw std::invalid_argument("Invalid resistor value.");
+                }
+            }
+            std::sort(prepared.begin(), prepared.end());
+            prepared.erase(std::unique(prepared.begin(), prepared.end()), prepared.end());
+            return prepared;
+        }
+
+        // Narrows the sorted lower-resistor values to the interval that can satisfy every filter for this upper resistor.
+        // Each expression is monotonic in the lower resistor, so binary searches discard impossible intervals
+        // without approximating the ranking.
+        class LowerWindow
+        {
+        public:
+            LowerWindow(const std::vector<double>& values, double rHigh, const SearchContext& context) : m_first(values.begin()), m_last(values.end())
+            {
+                const SearchConfig& config = context.config;
+
+                restrict(config.lowRange, [](double low) { return low; });
+                restrict(config.seriesRange, [rHigh](double low) { return rHigh + low; });
+                restrict(config.parallelRange, [rHigh](double low) { return parallelResistance(rHigh, low); });
+
+                if (config.powerRange.enabled && !config.loadResistance)
+                {
+                    const auto power = [&](double low) { return *config.vin * (*config.vin / (rHigh + low)); };
+                    m_first = std::partition_point(m_first, m_last, [&](double low) { return power(low) > config.powerRange.max; });
+                    m_last = std::partition_point(m_first, m_last, [&](double low) { return power(low) >= config.powerRange.min; });
+                }
+
+                if (config.maxErrorPercent)
+                {
+                    // Both extreme ratios increase monotonically with the lower resistor.
+                    const auto errorAtLowExtreme = [&](double low) { return ratioErrorPercent(context.model.ratio(rHigh * (1.0 + context.highTolerance), low * (1.0 - context.lowTolerance)), config.targetRatio); };
+                    const auto errorAtHighExtreme = [&](double low) { return ratioErrorPercent(context.model.ratio(rHigh * (1.0 - context.highTolerance), low * (1.0 + context.lowTolerance)), config.targetRatio); };
+                    m_first = std::partition_point(m_first, m_last, [&](double low) { return errorAtLowExtreme(low) < -*config.maxErrorPercent; });
+                    m_last = std::partition_point(m_first, m_last, [&](double low) { return errorAtHighExtreme(low) <= *config.maxErrorPercent; });
+                }
+            }
+
+            ValueIterator begin() const
+            {
+                return m_first;
+            }
+
+            ValueIterator end() const
+            {
+                return m_last;
+            }
+
+        private:
+            template <typename Expression>
+            void restrict(const Range& range, const Expression& expression)
+            {
+                if (!range.enabled)
+                {
+                    return;
+                }
+                m_first = std::partition_point(m_first, m_last, [&](double low) { return expression(low) < range.min; });
+                m_last = std::partition_point(m_first, m_last, [&](double low) { return expression(low) <= range.max; });
+            }
+
+            ValueIterator m_first;
+            ValueIterator m_last;
+        };
+
+        // Filters that need the full candidate (after the window has removed the obviously impossible ones).
+        bool passesFilters(const DividerCandidate& candidate, const SearchConfig& config)
+        {
+            if (!config.powerRange.contains(candidate.power))
+            {
+                return false;
+            }
+            if (config.ratedPower && std::max(candidate.powerHighMax, candidate.powerLowMax) > *config.ratedPower)
+            {
+                return false;
+            }
+            if (config.maxErrorPercent && std::max(std::abs(candidate.lowRatioErrorPercent), std::abs(candidate.highRatioErrorPercent)) > *config.maxErrorPercent)
+            {
+                return false;
+            }
+            return true;
         }
 
     } // namespace
@@ -148,101 +336,34 @@ namespace divider
             return {};
         }
 
-        if (config.powerRange.enabled && !config.vin)
-        {
-            throw std::invalid_argument("Power filtering requires VIN.");
-        }
-        if (config.ratedPower && !config.vin)
-        {
-            throw std::invalid_argument("Rated power filtering requires VIN.");
-        }
-        if (config.ratedPower && (!std::isfinite(*config.ratedPower) || *config.ratedPower <= 0.0))
-        {
-            throw std::invalid_argument("Invalid rated power.");
-        }
+        validateConfig(config);
+        const std::vector<double> highSorted = prepareValues(highValues);
+        const std::vector<double> lowSorted = prepareValues(lowValues);
 
-        const auto finite = [](double value) { return std::isfinite(value); };
-        if (!finite(config.targetRatio) || config.targetRatio <= 0.0 || config.targetRatio >= 1.0 ||
-            !finite(config.tolerancePercent) || config.tolerancePercent < 0.0 || config.tolerancePercent >= 100.0 ||
-            (config.lowTolerancePercent && (!finite(*config.lowTolerancePercent) || *config.lowTolerancePercent < 0.0 || *config.lowTolerancePercent >= 100.0)) ||
-            !finite(config.factor) || config.factor < 0.0 || config.factor > 1.0)
-            throw std::invalid_argument("Invalid search target, tolerance or factor.");
-        if (config.loadResistance && (!finite(*config.loadResistance) || *config.loadResistance <= 0.0))
-            throw std::invalid_argument("Invalid load resistance.");
-        if (config.maxErrorPercent && (!finite(*config.maxErrorPercent) || *config.maxErrorPercent < 0.0))
-            throw std::invalid_argument("Invalid maximum error.");
-        if (config.vin.has_value() != config.vout.has_value() ||
-            (config.vin && (!finite(*config.vin) || !finite(*config.vout) || *config.vout <= 0.0 || *config.vin <= *config.vout)))
-            throw std::invalid_argument("Invalid voltage pair.");
-        for (const Range* range : {&config.seriesRange, &config.parallelRange, &config.highRange, &config.lowRange, &config.powerRange})
-        {
-            if (range->enabled && (!finite(range->min) || !finite(range->max) || range->min > range->max ||
-                range->min < 0.0 || (range != &config.powerRange && range->min == 0.0)))
-                throw std::invalid_argument("Invalid search range.");
-        }
-        const auto prepare = [&finite](const std::vector<double>& source)
-        {
-            std::vector<double> prepared = source;
-            for (double value : prepared)
-                if (!finite(value) || value <= 0.0 || value > 1.0e150)
-                    throw std::invalid_argument("Invalid resistor value.");
-            std::sort(prepared.begin(), prepared.end());
-            prepared.erase(std::unique(prepared.begin(), prepared.end()), prepared.end());
-            return prepared;
-        };
-        const std::vector<double> highSorted = prepare(highValues);
-        const std::vector<double> values = prepare(lowValues);
         const double highTolerancePercent = config.tolerancePercent;
         const double lowTolerancePercent = config.lowTolerancePercent.value_or(config.tolerancePercent);
+        const SearchContext context{config, DividerModel{config.loadResistance}, highTolerancePercent / 100.0, lowTolerancePercent / 100.0};
 
         std::priority_queue<DividerCandidate, std::vector<DividerCandidate>, WorstFirst> best;
-        for (double rHigh : highSorted)
+        for (const double rHigh : highSorted)
         {
-            if (!config.highRange.contains(rHigh)) continue;
-            auto first = values.begin();
-            auto last = values.end();
-            // Each expression is monotonic in the lower resistor. Binary searches
-            // discard impossible intervals without approximating the ranking.
-            const auto restrictRange = [&](const Range& range, const auto& expression)
+            if (!config.highRange.contains(rHigh))
             {
-                if (!range.enabled) return;
-                first = std::partition_point(first, last, [&](double low) { return expression(low) < range.min; });
-                last = std::partition_point(first, last, [&](double low) { return expression(low) <= range.max; });
-            };
-            restrictRange(config.lowRange, [](double low) { return low; });
-            restrictRange(config.seriesRange, [rHigh](double low) { return rHigh + low; });
-            restrictRange(config.parallelRange, [rHigh](double low) { return parallelResistance(rHigh, low); });
-            if (config.powerRange.enabled && !config.loadResistance)
-            {
-                const auto power = [&](double low) { return *config.vin * (*config.vin / (rHigh + low)); };
-                first = std::partition_point(first, last, [&](double low) { return power(low) > config.powerRange.max; });
-                last = std::partition_point(first, last, [&](double low) { return power(low) >= config.powerRange.min; });
+                continue;
             }
-            if (config.maxErrorPercent)
+
+            const LowerWindow window(lowSorted, rHigh, context);
+            for (auto it = window.begin(); it != window.end(); ++it)
             {
-                const double highTolerance = highTolerancePercent / 100.0;
-                const double lowTolerance = lowTolerancePercent / 100.0;
-                const auto ratio = [&](double high, double low)
+                const DividerCandidate candidate = makeCandidate(rHigh, *it, context);
+                if (!passesFilters(candidate, config))
                 {
-                    const double bottom = config.loadResistance ? parallelResistance(low, *config.loadResistance) : low;
-                    return bottom / (high + bottom);
-                };
-                // Both extreme ratios increase monotonically with the lower resistor.
-                first = std::partition_point(first, last, [&](double low) {
-                    return ((ratio(rHigh * (1.0 + highTolerance), low * (1.0 - lowTolerance)) - config.targetRatio) / config.targetRatio) * 100.0 < -*config.maxErrorPercent;
-                });
-                last = std::partition_point(first, last, [&](double low) {
-                    return ((ratio(rHigh * (1.0 - highTolerance), low * (1.0 + lowTolerance)) - config.targetRatio) / config.targetRatio) * 100.0 <= *config.maxErrorPercent;
-                });
-            }
-            for (auto it = first; it != last; ++it)
-            {
-                DividerCandidate candidate = makeCandidate(rHigh, *it, config.targetRatio, highTolerancePercent, lowTolerancePercent, config.factor, config.vin, config.vout, config.loadResistance);
-                if (!config.powerRange.contains(candidate.power)) continue;
-                if (config.ratedPower && std::max(candidate.powerHighMax, candidate.powerLowMax) > *config.ratedPower) continue;
-                if (config.maxErrorPercent && std::max(std::abs(candidate.lowRatioErrorPercent), std::abs(candidate.highRatioErrorPercent)) > *config.maxErrorPercent) continue;
-                if (!finite(candidate.ratioErrorScorePercent))
+                    continue;
+                }
+                if (!isFinite(candidate.ratioErrorScorePercent))
+                {
                     throw std::invalid_argument("Error calculation out of range; increase the target ratio.");
+                }
 
                 if (best.size() < config.top)
                 {
@@ -258,11 +379,9 @@ namespace divider
 
         std::vector<DividerCandidate> results;
         results.reserve(best.size());
-
-        while (!best.empty())
+        for (; !best.empty(); best.pop())
         {
             results.push_back(best.top());
-            best.pop();
         }
 
         std::sort(results.begin(), results.end(), betterCandidate);

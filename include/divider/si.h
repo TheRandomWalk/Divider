@@ -19,5 +19,6 @@ namespace divider
     std::string formatDecimal(double value, int digits);
     std::string formatSignedDecimal(double value, int digits);
     std::string formatCompactDecimal(double value);
+    bool isZeroNumber(std::string_view formatted); // True when the text has digits and all of them are zero.
 
 } // namespace divider

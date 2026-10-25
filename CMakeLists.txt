@@ -9,6 +9,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_library(divider_core
     src/cli.cpp
     src/e_series.cpp
+    src/machine_output.cpp
+    src/runner.cpp
     src/search.cpp
     src/si.cpp
     src/table.cpp

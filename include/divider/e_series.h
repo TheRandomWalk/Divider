@@ -14,6 +14,7 @@ namespace divider
     };
 
     const std::vector<SeriesDefinition>& allSeries();
+    const SeriesDefinition* findSeries(int valueCount); // nullptr when the series is not supported.
     std::vector<double> generateBaseValues(int valueCount);
     std::vector<double> generateSeriesValues(int valueCount);
 

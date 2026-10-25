@@ -18,59 +18,43 @@ namespace divider
 
         std::string trim(std::string_view text)
         {
-            const auto isSpace = [](unsigned char ch)
+            constexpr std::string_view whitespace = " \t\n\r";
+            const std::size_t begin = text.find_first_not_of(whitespace);
+            if (begin == std::string_view::npos)
             {
-                return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r';
-            };
-
-            std::size_t begin = 0;
-
-            while (begin < text.size() && isSpace(static_cast<unsigned char>(text[begin])))
-            {
-                ++begin;
+                return {};
             }
-
-            std::size_t end = text.size();
-
-            while (end > begin && isSpace(static_cast<unsigned char>(text[end - 1])))
-            {
-                --end;
-            }
-
-            return std::string(text.substr(begin, end - begin));
+            const std::size_t end = text.find_last_not_of(whitespace);
+            return std::string(text.substr(begin, end - begin + 1));
         }
 
         double prefixMultiplier(const std::string& suffix)
         {
+            struct Prefix
+            {
+                std::string_view symbols[4];
+                double multiplier;
+            };
+            static constexpr Prefix prefixes[]{
+                {{"u", "U", "\xC2\xB5", "\xCE\xBC"}, 1.0e-6},
+                {{"m"}, 1.0e-3},
+                {{"k", "K"}, 1.0e3},
+                {{"M"}, 1.0e6},
+                {{"g", "G"}, 1.0e9},
+                {{"t", "T"}, 1.0e12},
+            };
+
             if (suffix.empty())
             {
                 return 1.0;
             }
-            if (suffix == "u" || suffix == "U" || suffix == "\xC2\xB5" || suffix == "\xCE\xBC")
+            for (const auto& prefix : prefixes)
             {
-                return 1.0e-6;
+                if (std::find(std::begin(prefix.symbols), std::end(prefix.symbols), suffix) != std::end(prefix.symbols))
+                {
+                    return prefix.multiplier;
+                }
             }
-            if (suffix == "m")
-            {
-                return 1.0e-3;
-            }
-            if (suffix == "k" || suffix == "K")
-            {
-                return 1.0e3;
-            }
-            if (suffix == "M")
-            {
-                return 1.0e6;
-            }
-            if (suffix == "g" || suffix == "G")
-            {
-                return 1.0e9;
-            }
-            if (suffix == "t" || suffix == "T")
-            {
-                return 1.0e12;
-            }
-
             throw std::invalid_argument("Unknown SI prefix '" + suffix + "'.");
         }
 
@@ -126,27 +110,6 @@ namespace divider
             return output;
         }
 
-        bool formattedNumberIsZero(std::string_view text)
-        {
-            bool sawDigit = false;
-
-            for (const unsigned char ch : text)
-            {
-                if (!std::isdigit(ch))
-                {
-                    continue;
-                }
-
-                sawDigit = true;
-
-                if (ch != '0')
-                {
-                    return false;
-                }
-            }
-            return sawDigit;
-        }
-
     } // namespace
 
     double parseSiValue(std::string_view text)
@@ -176,6 +139,24 @@ namespace divider
         return result;
     }
 
+    bool isZeroNumber(std::string_view formatted)
+    {
+        bool sawDigit = false;
+        for (const unsigned char ch : formatted)
+        {
+            if (!std::isdigit(ch))
+            {
+                continue;
+            }
+            if (ch != '0')
+            {
+                return false;
+            }
+            sawDigit = true;
+        }
+        return sawDigit;
+    }
+
     std::string formatDecimal(double value, int digits)
     {
         std::ostringstream out;
@@ -186,7 +167,7 @@ namespace divider
     std::string formatSignedDecimal(double value, int digits)
     {
         std::string output = formatDecimal(std::abs(value), digits);
-        if (formattedNumberIsZero(output))
+        if (isZeroNumber(output))
         {
             return output;
         }
@@ -206,21 +187,14 @@ namespace divider
 
     SiScale chooseSiScale(double value)
     {
-        if (!std::isfinite(value))
-        {
-            return SiScale{1.0, ""};
-        }
-
-        if (value == 0.0)
+        const auto& prefixes = outputPrefixes();
+        if (!std::isfinite(value) || value == 0.0)
         {
             return SiScale{1.0, ""};
         }
 
         const double absolute = std::abs(value);
-        const auto& prefixes = outputPrefixes();
-
         const SiScale* selected = &prefixes.front();
-
         for (const auto& prefix : prefixes)
         {
             if (absolute >= prefix.multiplier)

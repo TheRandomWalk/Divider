@@ -3,8 +3,9 @@
 #include "divider/e_series.h"
 #include "divider/si.h"
 
-#include <charconv>
+#include <algorithm>
 #include <cerrno>
+#include <charconv>
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
@@ -12,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace divider
@@ -19,35 +21,36 @@ namespace divider
     namespace
     {
 
-        bool isOption(std::string_view value, std::string_view option)
+        [[noreturn]] void fail(const std::string& message)
         {
-            return value == option;
+            throw std::invalid_argument(message);
         }
 
-        std::string requireArgument(int argc, char** argv, int& index, std::string_view option)
+        // Parses the whole text as an integer; returns false on trailing or missing characters.
+        template <typename Integer>
+        bool parseWhole(std::string_view text, Integer& value)
         {
-            if (index + 1 >= argc)
-            {
-                throw std::invalid_argument("Missing value after " + std::string(option) + ".");
-            }
-            ++index;
-            return argv[index];
+            const char* end = text.data() + text.size();
+            const auto [ptr, error] = std::from_chars(text.data(), end, value);
+            return error == std::errc{} && ptr == end;
         }
 
-        double requireSiArgument(int argc, char** argv, int& index, std::string_view option)
+        // Parses the whole text as a finite double; returns false on trailing characters, overflow, NaN or infinity.
+        bool parseFiniteDouble(std::string_view text, double& value)
         {
-            return parseSiValue(requireArgument(argc, argv, index, option));
+            const std::string owned(text);
+            char* end = nullptr;
+            errno = 0;
+            value = std::strtod(owned.c_str(), &end);
+            return end != owned.c_str() && *end == '\0' && errno != ERANGE && std::isfinite(value);
         }
 
         std::size_t parsePositiveSize(std::string_view text, std::string_view option)
         {
             std::size_t value = 0;
-            const char* begin = text.data();
-            const char* end = text.data() + text.size();
-            auto [ptr, error] = std::from_chars(begin, end, value);
-            if (error != std::errc{} || ptr != end || value == 0)
+            if (!parseWhole(text, value) || value == 0)
             {
-                throw std::invalid_argument("Invalid positive integer for " + std::string(option) + ".");
+                fail("Invalid positive integer for " + std::string(option) + ".");
             }
             return value;
         }
@@ -55,104 +58,62 @@ namespace divider
         int parseDigits(std::string_view text)
         {
             int value = -1;
-            const char* begin = text.data();
-            const char* end = text.data() + text.size();
-            auto [ptr, error] = std::from_chars(begin, end, value);
-            if (error != std::errc{} || ptr != end || value < 0 || value > 9)
+            if (!parseWhole(text, value) || value < 0 || value > 9)
             {
-                throw std::invalid_argument("Invalid --digits value. Expected an integer from 0 to 9.");
+                fail("Invalid --digits value. Expected an integer from 0 to 9.");
             }
             return value;
         }
 
         double parsePercent(std::string_view text, std::string_view option, std::string_view what = "tolerance")
         {
-            std::string owned(text);
-            char* end = nullptr;
-            errno = 0;
-            const double value = std::strtod(owned.c_str(), &end);
-            if (end == owned.c_str() || *end != '\0' || errno == ERANGE || !std::isfinite(value) || value < 0.0 || value >= 100.0)
+            double value = 0.0;
+            if (!parseFiniteDouble(text, value) || value < 0.0 || value >= 100.0)
             {
-                throw std::invalid_argument("Invalid " + std::string(what) + " for " + std::string(option) + ". Expected 0 <= value < 100 percent.");
+                fail("Invalid " + std::string(what) + " for " + std::string(option) + ". Expected 0 <= value < 100 percent.");
             }
             return value;
         }
 
         double parseFactor(std::string_view text)
         {
-            std::string owned(text);
-            char* end = nullptr;
-            errno = 0;
-            const double value = std::strtod(owned.c_str(), &end);
-            if (end == owned.c_str() || *end != '\0' || errno == ERANGE || !std::isfinite(value) || value < 0.0 || value > 1.0)
+            double value = 0.0;
+            if (!parseFiniteDouble(text, value) || value < 0.0 || value > 1.0)
             {
-                throw std::invalid_argument("Invalid --factor value. Expected 0 <= factor <= 1.");
+                fail("Invalid --factor value. Expected 0 <= factor <= 1.");
             }
             return value;
         }
 
-        Range makeRange(double min, double max, std::string_view option)
+        enum class RangeBound
         {
-            if (min <= 0.0 || max <= 0.0)
+            Positive,
+            NonNegative,
+        };
+
+        Range makeRange(double min, double max, std::string_view option, RangeBound bound)
+        {
+            const bool positive = bound == RangeBound::Positive;
+            if (positive ? (min <= 0.0 || max <= 0.0) : (min < 0.0 || max < 0.0))
             {
-                throw std::invalid_argument("Invalid " + std::string(option) + " range. Values must be positive.");
+                fail("Invalid " + std::string(option) + " range. Values must be " + (positive ? "positive." : "non-negative."));
             }
             if (min > max)
             {
-                throw std::invalid_argument("Invalid " + std::string(option) + " range. Minimum must not exceed maximum.");
+                fail("Invalid " + std::string(option) + " range. Minimum must not exceed maximum.");
             }
             return Range{true, min, max};
         }
 
-        Range makeNonNegativeRange(double min, double max, std::string_view option)
+        // Recognizes the per-series tolerance override "--E<N>"; returns 0 when the option is not one.
+        int parseSeriesToleranceOption(std::string_view option)
         {
-            if (min < 0.0 || max < 0.0)
-            {
-                throw std::invalid_argument("Invalid " + std::string(option) + " range. Values must be non-negative.");
-            }
-            if (min > max)
-            {
-                throw std::invalid_argument("Invalid " + std::string(option) + " range. Minimum must not exceed maximum.");
-            }
-            return Range{true, min, max};
-        }
-
-        int parseSeriesOption(std::string_view option)
-        {
-            if (option.size() < 4 || option[0] != '-' || option[1] != '-' || option[2] != 'E')
+            if (!option.starts_with("--E"))
             {
                 return 0;
             }
-
             int value = 0;
-            const char* begin = option.data() + 3;
-            const char* end = option.data() + option.size();
-            auto [ptr, error] = std::from_chars(begin, end, value);
-            if (error != std::errc{} || ptr != end)
-            {
-                return 0;
-            }
-
-            for (const auto& series : allSeries())
-            {
-                if (series.valueCount == value)
-                {
-                    return value;
-                }
-            }
-            return 0;
-        }
-
-        bool isSupportedSeriesNumber(int value)
-        {
-            for (const auto& series : allSeries())
-            {
-                if (series.valueCount == value)
-                {
-                    return true;
-                }
-            }
-            return false;
+            return parseWhole(option.substr(3), value) && findSeries(value) ? value : 0;
         }
 
         int parseSeriesSelector(std::string_view text)
@@ -163,26 +124,11 @@ namespace divider
             }
 
             int value = 0;
-            const char* begin = text.data();
-            const char* end = text.data() + text.size();
-            auto [ptr, error] = std::from_chars(begin, end, value);
-            if (error != std::errc{} || ptr != end || !isSupportedSeriesNumber(value))
+            if (!parseWhole(text, value) || !findSeries(value))
             {
-                throw std::invalid_argument("Invalid --E series '" + std::string(text) + "'. Expected one of 3, 6, 12, 24, 48, 96, 192.");
+                fail("Invalid --E series '" + std::string(text) + "'. Expected one of 3, 6, 12, 24, 48, 96, 192.");
             }
             return value;
-        }
-
-        bool containsSeries(const std::vector<int>& selectedSeries, int value)
-        {
-            for (const int selected : selectedSeries)
-            {
-                if (selected == value)
-                {
-                    return true;
-                }
-            }
-            return false;
         }
 
         OutputFormat parseFormat(std::string_view text)
@@ -199,259 +145,309 @@ namespace divider
             {
                 return OutputFormat::Json;
             }
-            throw std::invalid_argument("Invalid --format value. Expected table, csv or json.");
+            fail("Invalid --format value. Expected table, csv or json.");
         }
 
-        void parseSeriesList(int argc, char** argv, int& index, std::vector<int>& selectedSeries, std::string_view option)
+        bool isTargetRatio(double ratio)
         {
-            bool foundSeries = false;
-            while (index + 1 < argc)
-            {
-                const std::string_view next(argv[index + 1]);
-                if (next.size() >= 2 && next[0] == '-' && next[1] == '-')
-                {
-                    break;
-                }
-
-                ++index;
-                const int seriesValue = parseSeriesSelector(next);
-                if (!containsSeries(selectedSeries, seriesValue))
-                {
-                    selectedSeries.push_back(seriesValue);
-                }
-                foundSeries = true;
-            }
-
-            if (!foundSeries)
-            {
-                throw std::invalid_argument("Missing series list after " + std::string(option) + ".");
-            }
+            return std::isfinite(ratio) && ratio > 0.0 && ratio < 1.0;
         }
 
-        void validateOptions(const Options& options)
+        // Walks argv once; each option handler pulls its own values from it.
+        class CommandLineParser
         {
-            if (options.help)
+        public:
+            CommandLineParser(int argc, char** argv) : m_argc(argc), m_argv(argv)
             {
-                return;
             }
-            if (options.useVoltage)
+
+            Options parse()
             {
-                if (options.vin <= 0.0 || options.vout <= 0.0 || options.vout >= options.vin)
+                for (m_index = 1; m_index < m_argc; ++m_index)
                 {
-                    throw std::invalid_argument("Invalid voltage pair. Expected VIN > VOUT > 0.");
+                    parseOption(m_argv[m_index]);
+                }
+                finish();
+                return m_options;
+            }
+
+        private:
+            using Handler = void (CommandLineParser::*)(std::string_view);
+
+            void parseOption(std::string_view option)
+            {
+                static const std::unordered_map<std::string_view, Handler> handlers{
+                    {"--help", &CommandLineParser::help},
+                    {"-h", &CommandLineParser::help},
+                    {"--ratio", &CommandLineParser::ratio},
+                    {"--vin-vout", &CommandLineParser::vinVout},
+                    {"--vin", &CommandLineParser::vin},
+                    {"--top", &CommandLineParser::top},
+                    {"--digits", &CommandLineParser::digits},
+                    {"--factor", &CommandLineParser::factor},
+                    {"--E", &CommandLineParser::seriesList},
+                    {"--E-high", &CommandLineParser::seriesList},
+                    {"--E-low", &CommandLineParser::seriesList},
+                    {"--rating", &CommandLineParser::rating},
+                    {"--derate", &CommandLineParser::derate},
+                    {"--format", &CommandLineParser::format},
+                    {"--series", &CommandLineParser::seriesRange},
+                    {"--parallel", &CommandLineParser::parallelRange},
+                    {"--high", &CommandLineParser::highRange},
+                    {"--low", &CommandLineParser::lowRange},
+                    {"--power", &CommandLineParser::powerRange},
+                    {"--load", &CommandLineParser::load},
+                    {"--max-error", &CommandLineParser::maxError},
+                };
+
+                if (const auto handler = handlers.find(option); handler != handlers.end())
+                {
+                    (this->*handler->second)(option);
+                    return;
+                }
+                if (const int series = parseSeriesToleranceOption(option))
+                {
+                    m_options.toleranceOverridesPercent[series] = parsePercent(value(option), option);
+                    return;
+                }
+                fail("Unknown option: " + std::string(option) + ".");
+            }
+
+            std::string_view value(std::string_view option)
+            {
+                if (m_index + 1 >= m_argc)
+                {
+                    fail("Missing value after " + std::string(option) + ".");
+                }
+                return m_argv[++m_index];
+            }
+
+            double siValue(std::string_view option)
+            {
+                return parseSiValue(value(option));
+            }
+
+            double positiveSiValue(std::string_view option)
+            {
+                const double result = siValue(option);
+                if (result <= 0.0)
+                {
+                    fail(std::string(option) + " must be positive.");
+                }
+                return result;
+            }
+
+            // Reads the "MIN MAX" pair shared by every interval option.
+            Range readRange(std::string_view option, RangeBound bound = RangeBound::Positive)
+            {
+                const double min = siValue(option);
+                const double max = siValue(option);
+                return makeRange(min, max, option, bound);
+            }
+
+            // Consumes series names up to the next "--" option.
+            void readSeriesList(std::string_view option, std::vector<int>& target)
+            {
+                bool found = false;
+                while (m_index + 1 < m_argc && !std::string_view(m_argv[m_index + 1]).starts_with("--"))
+                {
+                    const int series = parseSeriesSelector(m_argv[++m_index]);
+                    if (std::find(target.begin(), target.end(), series) == target.end())
+                    {
+                        target.push_back(series);
+                    }
+                    found = true;
+                }
+                if (!found)
+                {
+                    fail("Missing series list after " + std::string(option) + ".");
                 }
             }
-            if (!std::isfinite(options.ratio) || options.ratio <= 0.0 || options.ratio >= 1.0)
+
+            void requireSingleTarget() const
             {
-                throw std::invalid_argument("Invalid ratio. Expected 0 < ratio < 1.");
+                if (m_ratioProvided || m_voltageProvided)
+                {
+                    fail("Use exactly one target mode: --ratio or --vin-vout.");
+                }
             }
-            if (!options.useVoltage && options.powerRange.enabled)
+
+            void help(std::string_view)
             {
-                throw std::invalid_argument("--power is only valid with --vin-vout or --vin.");
+                m_options.help = true;
             }
-            if (!options.useVoltage && options.ratedPower)
+
+            void ratio(std::string_view option)
             {
-                throw std::invalid_argument("--rating is only valid with --vin-vout or --vin.");
+                requireSingleTarget();
+                m_options.ratio = siValue(option);
+                m_ratioProvided = true;
             }
-            if (options.deratePercent && !options.ratedPower)
+
+            void vinVout(std::string_view option)
             {
-                throw std::invalid_argument("--derate requires --rating.");
+                requireSingleTarget();
+                m_options.vin = siValue(option);
+                m_options.vout = siValue(option);
+                m_options.ratio = m_options.vout / m_options.vin;
+                m_options.useVoltage = true;
+                m_voltageProvided = true;
             }
-        }
+
+            void vin(std::string_view option)
+            {
+                m_inputVoltage = positiveSiValue(option);
+            }
+
+            void top(std::string_view option)
+            {
+                m_options.top = parsePositiveSize(value(option), option);
+            }
+
+            void digits(std::string_view option)
+            {
+                m_options.digitsProvided = true;
+                m_options.digits = parseDigits(value(option));
+            }
+
+            void factor(std::string_view option)
+            {
+                m_options.factor = parseFactor(value(option));
+            }
+
+            void seriesList(std::string_view option)
+            {
+                std::vector<int>& target = option == "--E-high" ? m_options.highSeries : option == "--E-low" ? m_options.lowSeries : m_options.selectedSeries;
+                readSeriesList(option, target);
+            }
+
+            void rating(std::string_view option)
+            {
+                m_options.ratedPower = positiveSiValue(option);
+            }
+
+            void derate(std::string_view option)
+            {
+                m_options.deratePercent = parsePercent(value(option), option, "derating");
+            }
+
+            void format(std::string_view option)
+            {
+                m_options.format = parseFormat(value(option));
+            }
+
+            void seriesRange(std::string_view option)
+            {
+                m_options.seriesRange = readRange(option);
+            }
+
+            void parallelRange(std::string_view option)
+            {
+                m_options.parallelRange = readRange(option);
+            }
+
+            void highRange(std::string_view option)
+            {
+                m_options.highRange = readRange(option);
+            }
+
+            void lowRange(std::string_view option)
+            {
+                m_options.lowRange = readRange(option);
+            }
+
+            void powerRange(std::string_view option)
+            {
+                m_options.powerRange = readRange(option, RangeBound::NonNegative);
+            }
+
+            void load(std::string_view option)
+            {
+                m_options.loadResistance = positiveSiValue(option);
+            }
+
+            void maxError(std::string_view option)
+            {
+                const double percent = siValue(option);
+                if (percent < 0.0)
+                {
+                    fail("--max-error must be non-negative.");
+                }
+                m_options.maxErrorPercent = percent;
+            }
+
+            // Checks that need the whole command line.
+            void finish()
+            {
+                if (!m_options.help && !m_ratioProvided && !m_voltageProvided)
+                {
+                    fail("Missing target. Use --ratio or --vin-vout.");
+                }
+
+                if (m_inputVoltage)
+                {
+                    if (m_voltageProvided)
+                    {
+                        fail("--vin cannot be combined with --vin-vout.");
+                    }
+                    if (!m_ratioProvided)
+                    {
+                        fail("--vin requires --ratio.");
+                    }
+                    if (!isTargetRatio(m_options.ratio))
+                    {
+                        fail("Invalid ratio. Expected 0 < ratio < 1.");
+                    }
+                    m_options.vin = *m_inputVoltage;
+                    m_options.vout = m_options.ratio * m_options.vin;
+                    m_options.useVoltage = true;
+                }
+
+                validate();
+            }
+
+            void validate() const
+            {
+                if (m_options.help)
+                {
+                    return;
+                }
+                if (m_options.useVoltage && (m_options.vin <= 0.0 || m_options.vout <= 0.0 || m_options.vout >= m_options.vin))
+                {
+                    fail("Invalid voltage pair. Expected VIN > VOUT > 0.");
+                }
+                if (!isTargetRatio(m_options.ratio))
+                {
+                    fail("Invalid ratio. Expected 0 < ratio < 1.");
+                }
+                if (!m_options.useVoltage && m_options.powerRange.enabled)
+                {
+                    fail("--power is only valid with --vin-vout or --vin.");
+                }
+                if (!m_options.useVoltage && m_options.ratedPower)
+                {
+                    fail("--rating is only valid with --vin-vout or --vin.");
+                }
+                if (m_options.deratePercent && !m_options.ratedPower)
+                {
+                    fail("--derate requires --rating.");
+                }
+            }
+
+            int m_argc;
+            char** m_argv;
+            int m_index = 0;
+            Options m_options;
+            bool m_ratioProvided = false;
+            bool m_voltageProvided = false;
+            std::optional<double> m_inputVoltage;
+        };
 
     } // namespace
 
     Options parseCommandLine(int argc, char** argv)
     {
-        Options options;
-        bool ratioProvided = false;
-        bool voltageProvided = false;
-        std::optional<double> inputVoltage;
-
-        for (int index = 1; index < argc; ++index)
-        {
-            const std::string_view arg(argv[index]);
-
-            if (isOption(arg, "--help") || isOption(arg, "-h"))
-            {
-                options.help = true;
-                continue;
-            }
-
-            if (isOption(arg, "--ratio"))
-            {
-                if (voltageProvided || ratioProvided)
-                {
-                    throw std::invalid_argument("Use exactly one target mode: --ratio or --vin-vout.");
-                }
-                options.ratio = requireSiArgument(argc, argv, index, arg);
-                ratioProvided = true;
-                continue;
-            }
-
-            if (isOption(arg, "--vin-vout"))
-            {
-                if (voltageProvided || ratioProvided)
-                {
-                    throw std::invalid_argument("Use exactly one target mode: --ratio or --vin-vout.");
-                }
-
-                options.vin = requireSiArgument(argc, argv, index, arg);
-                options.vout = requireSiArgument(argc, argv, index, arg);
-                options.ratio = options.vout / options.vin;
-                options.useVoltage = true;
-                voltageProvided = true;
-                continue;
-            }
-
-            if (isOption(arg, "--top"))
-            {
-                options.top = parsePositiveSize(requireArgument(argc, argv, index, arg), arg);
-                continue;
-            }
-
-            if (isOption(arg, "--digits"))
-            {
-                options.digitsProvided = true;
-                options.digits = parseDigits(requireArgument(argc, argv, index, arg));
-                continue;
-            }
-
-            if (isOption(arg, "--factor"))
-            {
-                options.factor = parseFactor(requireArgument(argc, argv, index, arg));
-                continue;
-            }
-
-            if (isOption(arg, "--E"))
-            {
-                parseSeriesList(argc, argv, index, options.selectedSeries, arg);
-                continue;
-            }
-
-            if (isOption(arg, "--E-high"))
-            {
-                parseSeriesList(argc, argv, index, options.highSeries, arg);
-                continue;
-            }
-
-            if (isOption(arg, "--E-low"))
-            {
-                parseSeriesList(argc, argv, index, options.lowSeries, arg);
-                continue;
-            }
-
-            if (isOption(arg, "--vin"))
-            {
-                const double value = requireSiArgument(argc, argv, index, arg);
-                if (value <= 0.0) throw std::invalid_argument("--vin must be positive.");
-                inputVoltage = value;
-                continue;
-            }
-
-            if (isOption(arg, "--rating"))
-            {
-                const double value = requireSiArgument(argc, argv, index, arg);
-                if (value <= 0.0) throw std::invalid_argument("--rating must be positive.");
-                options.ratedPower = value;
-                continue;
-            }
-
-            if (isOption(arg, "--derate"))
-            {
-                options.deratePercent = parsePercent(requireArgument(argc, argv, index, arg), arg, "derating");
-                continue;
-            }
-
-            if (isOption(arg, "--format"))
-            {
-                options.format = parseFormat(requireArgument(argc, argv, index, arg));
-                continue;
-            }
-
-            if (isOption(arg, "--series"))
-            {
-                const double min = requireSiArgument(argc, argv, index, arg);
-                const double max = requireSiArgument(argc, argv, index, arg);
-                options.seriesRange = makeRange(min, max, arg);
-                continue;
-            }
-
-            if (isOption(arg, "--parallel"))
-            {
-                const double min = requireSiArgument(argc, argv, index, arg);
-                const double max = requireSiArgument(argc, argv, index, arg);
-                options.parallelRange = makeRange(min, max, arg);
-                continue;
-            }
-
-            if (isOption(arg, "--high") || isOption(arg, "--low"))
-            {
-                const double min = requireSiArgument(argc, argv, index, arg);
-                const double max = requireSiArgument(argc, argv, index, arg);
-                (arg == "--high" ? options.highRange : options.lowRange) = makeRange(min, max, arg);
-                continue;
-            }
-            if (isOption(arg, "--load"))
-            {
-                const double value = requireSiArgument(argc, argv, index, arg);
-                if (value <= 0.0) throw std::invalid_argument("--load must be positive.");
-                options.loadResistance = value;
-                continue;
-            }
-            if (isOption(arg, "--max-error"))
-            {
-                const double value = requireSiArgument(argc, argv, index, arg);
-                if (value < 0.0) throw std::invalid_argument("--max-error must be non-negative.");
-                options.maxErrorPercent = value;
-                continue;
-            }
-
-            if (isOption(arg, "--power"))
-            {
-                const double min = requireSiArgument(argc, argv, index, arg);
-                const double max = requireSiArgument(argc, argv, index, arg);
-                options.powerRange = makeNonNegativeRange(min, max, arg);
-                continue;
-            }
-
-            const int seriesValue = parseSeriesOption(arg);
-
-            if (seriesValue != 0)
-            {
-                options.toleranceOverridesPercent[seriesValue] = parsePercent(requireArgument(argc, argv, index, arg), arg);
-                continue;
-            }
-
-            throw std::invalid_argument("Unknown option: " + std::string(arg) + ".");
-        }
-
-        if (!options.help && !ratioProvided && !voltageProvided)
-        {
-            throw std::invalid_argument("Missing target. Use --ratio or --vin-vout.");
-        }
-
-        if (inputVoltage)
-        {
-            if (voltageProvided)
-            {
-                throw std::invalid_argument("--vin cannot be combined with --vin-vout.");
-            }
-            if (!ratioProvided)
-            {
-                throw std::invalid_argument("--vin requires --ratio.");
-            }
-            if (!std::isfinite(options.ratio) || options.ratio <= 0.0 || options.ratio >= 1.0)
-            {
-                throw std::invalid_argument("Invalid ratio. Expected 0 < ratio < 1.");
-            }
-            options.vin = *inputVoltage;
-            options.vout = options.ratio * options.vin;
-            options.useVoltage = true;
-        }
-
-        validateOptions(options);
-        return options;
+        return CommandLineParser(argc, argv).parse();
     }
 
     std::string usage(std::string_view executableName)

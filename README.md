@@ -262,7 +262,7 @@ Each resistor uses the tolerance of its series (the same one when both come from
 
 ## Project structure
 
-- `src/`: CLI, E series, search, and table implementations.
+- `src/`: CLI parsing, E series, search, SI formatting, table and CSV/JSON output, and the runner that ties them together (`main.cpp` only handles the console and errors).
 - `include/divider/`: library interfaces.
 - `tests/unit_tests.cpp`: calculation, option, and output tests.
 - `CMakeLists.txt`: build and test configuration.
